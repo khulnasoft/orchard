@@ -1,0 +1,208 @@
+package controller
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"github.com/khulnasoft/orchard/internal/controller/notifier"
+	"github.com/khulnasoft/orchard/internal/controller/proxy"
+	"github.com/khulnasoft/orchard/internal/controller/scheduler"
+	storepkg "github.com/khulnasoft/orchard/internal/controller/store"
+	"github.com/khulnasoft/orchard/internal/controller/store/badger"
+	"github.com/khulnasoft/orchard/internal/netconstants"
+	v1 "github.com/khulnasoft/orchard/pkg/resource/v1"
+	"github.com/khulnasoft/orchard/rpc"
+	"go.uber.org/zap"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
+	"net"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+)
+
+var (
+	ErrInitFailed      = errors.New("controller initialization failed")
+	ErrAdminTaskFailed = errors.New("controller administrative task failed")
+)
+
+const (
+	maxWorkersPerDefaultLicense  = 4
+	maxWorkersPerGoldLicense     = 20
+	maxWorkersPerPlatinumLicense = 200
+)
+
+type Controller struct {
+	dataDir              *DataDir
+	listenAddr           string
+	tlsConfig            *tls.Config
+	listener             net.Listener
+	httpServer           *http.Server
+	insecureAuthDisabled bool
+	scheduler            *scheduler.Scheduler
+	store                storepkg.Store
+	logger               *zap.SugaredLogger
+	grpcServer           *grpc.Server
+	workerNotifier       *notifier.Notifier
+	proxy                *proxy.Proxy
+	enableSwaggerDocs    bool
+	workerOfflineTimeout time.Duration
+	maxWorkersPerLicense uint
+
+	rpc.UnimplementedControllerServer
+}
+
+func New(opts ...Option) (*Controller, error) {
+	controller := &Controller{
+		proxy:                proxy.NewProxy(),
+		workerOfflineTimeout: 3 * time.Minute,
+		maxWorkersPerLicense: maxWorkersPerDefaultLicense,
+	}
+
+	// Apply options
+	for _, opt := range opts {
+		opt(controller)
+	}
+
+	// Apply environment variables
+	orchardLicenseTier, ok := os.LookupEnv("ORCHARD_LICENSE_TIER")
+	if ok {
+		switch orchardLicenseTier {
+		case "gold":
+			controller.maxWorkersPerLicense = maxWorkersPerGoldLicense
+		case "platinum":
+			controller.maxWorkersPerLicense = maxWorkersPerPlatinumLicense
+		default:
+			return nil, fmt.Errorf("%w: invalid ORCHARD_LICENSE_TIER value: %q",
+				ErrInitFailed, orchardLicenseTier)
+		}
+	}
+
+	// Apply defaults
+	if controller.dataDir == nil {
+		return nil, fmt.Errorf("%w: please specify the data directory path with WithDataDir()",
+			ErrInitFailed)
+	}
+	if controller.listenAddr == "" {
+		controller.listenAddr = fmt.Sprintf(":%d", netconstants.DefaultControllerPort)
+	}
+	if controller.logger == nil {
+		controller.logger = zap.NewNop().Sugar()
+	}
+
+	// Instantiate controller
+	store, err := badger.NewBadgerStore(controller.dataDir.DBPath())
+	if err != nil {
+		return nil, err
+	}
+	controller.store = store
+	controller.workerNotifier = notifier.NewNotifier(controller.logger.With("component", "rpc"))
+	controller.scheduler = scheduler.NewScheduler(store, controller.workerNotifier,
+		controller.workerOfflineTimeout, controller.logger)
+
+	listener, err := net.Listen("tcp", controller.listenAddr)
+	if err != nil {
+		return nil, err
+	}
+	if controller.tlsConfig != nil {
+		controller.listener = tls.NewListener(listener, controller.tlsConfig)
+	} else {
+		controller.listener = listener
+	}
+
+	apiServer := controller.initAPI()
+
+	controller.grpcServer = grpc.NewServer(
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time: 30 * time.Second,
+		}),
+	)
+	rpc.RegisterControllerServer(controller.grpcServer, controller)
+
+	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Content-Type") == "application/grpc" {
+			controller.grpcServer.ServeHTTP(writer, request)
+		} else {
+			apiServer.ServeHTTP(writer, request)
+		}
+	})
+
+	controller.httpServer = &http.Server{
+		Handler:           h2c.NewHandler(handler, &http2.Server{}),
+		ReadHeaderTimeout: 60 * time.Second,
+	}
+
+	// Ensure cluster settings object is present
+	if err := controller.store.Update(func(txn storepkg.Transaction) error {
+		_, err := txn.GetClusterSettings()
+		if errors.Is(err, storepkg.ErrNotFound) {
+			return txn.SetClusterSettings(v1.ClusterSettings{})
+		}
+
+		return err
+	}); err != nil {
+		return nil, fmt.Errorf("%w: failed to ensure cluster settings object is present: %v",
+			ErrInitFailed, err)
+	}
+
+	return controller, nil
+}
+
+func (controller *Controller) EnsureServiceAccount(serviceAccount *v1.ServiceAccount) error {
+	if serviceAccount.Name == "" {
+		return fmt.Errorf("%w: attempted to create a service account with an empty name",
+			ErrAdminTaskFailed)
+	}
+
+	if serviceAccount.Token == "" {
+		return fmt.Errorf("%w: attempted to create a service account with an empty token",
+			ErrAdminTaskFailed)
+	}
+
+	serviceAccount.CreatedAt = time.Now()
+
+	return controller.store.Update(func(txn storepkg.Transaction) error {
+		return txn.SetServiceAccount(serviceAccount)
+	})
+}
+
+func (controller *Controller) DeleteServiceAccount(name string) error {
+	return controller.store.Update(func(txn storepkg.Transaction) error {
+		return txn.DeleteServiceAccount(name)
+	})
+}
+
+func (controller *Controller) Run(ctx context.Context) error {
+	// Run the scheduler so that each VM will eventually
+	// be assigned to a specific Worker
+	go controller.scheduler.Run()
+
+	// A helper function to shut down the HTTP server on context cancellation
+	go func() {
+		<-ctx.Done()
+
+		if err := controller.httpServer.Shutdown(ctx); err != nil {
+			controller.logger.Errorf("failed to cleanly shutdown the HTTP server: %v", err)
+		}
+	}()
+
+	if err := controller.httpServer.Serve(controller.listener); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (controller *Controller) Address() string {
+	hostPort := strings.ReplaceAll(controller.listener.Addr().String(), "[::]", "127.0.0.1")
+
+	if controller.tlsConfig != nil {
+		return fmt.Sprintf("https://%s", hostPort)
+	}
+
+	return fmt.Sprintf("http://%s", hostPort)
+}
